@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <errno.h>
 
+#if 0
 struct DNS_HEADER
 {
 	unsigned short id; /* identification number */
@@ -35,11 +36,7 @@ struct DNS_HEADER
 static char blacklist[100][255];
 static size_t nr_blacklisted;
 
-void die(const char *msg)
-{
-	perror(msg);
-	exit(-1);
-}
+
 
 static int name_blacklisted(const char *name)
 {
@@ -106,94 +103,57 @@ static void print_blacklist()
 	for (i=0; i < nr_blacklisted; i++)
 		puts(blacklist[i]);
 }
-
-static int udp_incoming_sock(short port)
+#endif
+void die(const char *msg)
+{
+	perror(msg);
+	exit(-1);
+}
+static int udpsock();
+static void make_listen_sockaddr(struct sockaddr_in *outaddr, short port);
+static void make_upstream_sockaddr(struct sockaddr_in *outaddr,
+	const char *host, short port);
+static int udp_listen_sock(short port)
 {
 	int sockfd;
 	int optval = 1;
 	struct sockaddr_in si; /* server's addr */
 
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sockfd < 0) 
-		die("dnsp_udp_incoming_sock: error opening socket");
+	sockfd = udpsock();
 
 	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
 		(const void *)&optval , sizeof(int));
 
-	memset(&si, 0, sizeof(si));
-	si.sin_family = AF_INET;
-	si.sin_addr.s_addr = htonl(INADDR_ANY);
-	si.sin_port = htons((unsigned short)port);
+	make_listen_sockaddr(&si, port);
 
 	if (bind(sockfd, (struct sockaddr *) &si, sizeof(si)) < 0) 
-		die("dnsp_udp_incoming_sock: error on binding");
+		die("udp_listen_sock: error on binding");
 
 	return sockfd;
 }
 
-static void input_loop(short port)
+static int udp_upstream_sock(const char *host, short port)
 {
-	int netfd;
-	char netin_buf[1024];
-	char stdin_buf[1024];
-	struct sockaddr_in client;
-	socklen_t client_len = sizeof(client);
-	int netin_nrecvd;
-	int stdin_nrecvd;
-	fd_set readfds, writefds;
-	int nready;
+	int sockfd;
+	struct sockaddr_in si;
+	socklen_t len = sizeof(si);
 
-	netfd = udp_incoming_sock(port);
-	FD_ZERO(&writefds);
+	sockfd = udpsock();
+	make_upstream_sockaddr(&si, host, port);
+	
+	if (connect(sockfd, (struct sockaddr *)&si, len) < 0)
+		die("udp_upstream_sock: error on connect");
 
-	for (;;) {
-		FD_ZERO(&readfds);
-
-		FD_SET(netfd, &readfds);
-		FD_SET(STDIN_FILENO, &readfds);
-
-		nready = select(10, &readfds, &writefds, 0, 0);
-
-		if (FD_ISSET(STDOUT_FILENO, &writefds)) {
-			/* write to netfd */
-			write(STDOUT_FILENO, netin_buf, netin_nrecvd);
-			/* remove self from polling */
-			FD_CLR(STDOUT_FILENO, &writefds);
-		}
-
-		if (FD_ISSET(netfd, &writefds)) {
-			/* write to netfd */
-			sendto(netfd, stdin_buf, stdin_nrecvd, 0,
-				(struct sockaddr *)&client, client_len);
-			FD_CLR(netfd, &writefds);
-		}
-
-		if (FD_ISSET(STDIN_FILENO, &readfds)) {
-			/* Read from stdin */
-			stdin_nrecvd = read(STDIN_FILENO, stdin_buf,
-				sizeof(stdin_buf));
-			FD_SET(netfd, &writefds);
-		}
-
-		if (FD_ISSET(netfd, &readfds)) {
-			/* Read from netfd */
-			netin_nrecvd = recvfrom(netfd, netin_buf,
-				sizeof(netin_buf), 0,
-				(struct sockaddr *)&client, &client_len);
-			FD_SET(STDOUT_FILENO, &writefds);
-		}
-
-	}
-
+	return sockfd;
 }
 
-static int udp_upstream_sock()
+static int udpsock()
 {
 	int sockfd;
 
 	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0) 
-		die("udp_upstream_sock: error opening socket");
+		die("udpsock: error opening socket");
 
 	return sockfd;
 }
@@ -203,54 +163,88 @@ static const char *get_upstream_address()
 	return "8.8.8.8";
 }
 
-static void make_upstream_sockaddr(struct sockaddr_in *outaddr)
+static void make_upstream_sockaddr(struct sockaddr_in *outaddr,
+	const char *host, short port)
 {
 	struct sockaddr_in si;
 
 	memset(&si, 0, sizeof(si));
 	si.sin_family = AF_INET;
-	si.sin_addr.s_addr = inet_addr(get_upstream_address());
-	si.sin_port = htons((unsigned short)53);
+	si.sin_addr.s_addr = inet_addr(host);
+	si.sin_port = htons(port);
 
 	*outaddr = si;
 }
 
-static void output_loop()
+static void make_listen_sockaddr(struct sockaddr_in *outaddr, short port)
 {
-	int netfd;
-	char netin_buf[1024];
-	char stdin_buf[1024];
-	struct sockaddr_in upstream;
-	socklen_t upstream_len = sizeof(upstream);
-	int netin_nrecvd;
-	int stdin_nrecvd;
-	fd_set readfds, writefds;
+	struct sockaddr_in si;
+
+	memset(&si, 0, sizeof(si));
+	si.sin_family = AF_INET;
+	si.sin_addr.s_addr = htonl(INADDR_ANY);
+	si.sin_port = htons(port);
+
+	*outaddr = si;
+}
+
+static void connect_to_first_client(int netfd)
+{
+	int rv;
+	char buf[1024];
+	struct sockaddr_in si;
+	socklen_t len = sizeof(si);
+
+	rv = recvfrom(netfd, buf, sizeof(buf), MSG_PEEK,
+		(struct sockaddr *)&si, &len);
+	if (rv < 0)
+		die("recvfrom");
+
+	rv = connect(netfd, (struct sockaddr *)&si, len);
+	if (rv < 0)
+		die("connect");
+}
+
+static void rwloop(int netfd)
+{
+	char netin_buf[1024], stdin_buf[1024];
+	int netin_nrecvd, stdin_nrecvd;
+	int netout_nsent, stdout_nsent;
+	fd_set master_readfds, readfds, writefds;
 	int nready;
 
-	netfd = udp_upstream_sock();
-	make_upstream_sockaddr(&upstream);
-
+	FD_ZERO(&master_readfds);
+	FD_ZERO(&readfds);
 	FD_ZERO(&writefds);
 
-	for (;;) {
-		FD_ZERO(&readfds);
+	FD_SET(netfd, &master_readfds);
+	FD_SET(STDIN_FILENO, &master_readfds);
 
-		FD_SET(netfd, &readfds);
-		FD_SET(STDIN_FILENO, &readfds);
+	for (;;) {
+		readfds = master_readfds;
 
 		nready = select(10, &readfds, &writefds, 0, 0);
 
+		fprintf(stderr, "nready %d\n", nready);
 		if (FD_ISSET(STDOUT_FILENO, &writefds)) {
-			/* write to netfd */
-			write(STDOUT_FILENO, netin_buf, netin_nrecvd);
+			/* write to stdout */
+			stdout_nsent = write(STDOUT_FILENO, netin_buf, netin_nrecvd);
+
+			if (stdout_nsent < 0)
+				die("-1 on write to stdout");
+			else
+				fprintf(stderr, "%d/%d bytes to stdout\n", stdout_nsent, netin_nrecvd);
 			/* remove self from polling */
 			FD_CLR(STDOUT_FILENO, &writefds);
 		}
 
 		if (FD_ISSET(netfd, &writefds)) {
 			/* write to netfd */
-			sendto(netfd, stdin_buf, stdin_nrecvd, 0,
-				(struct sockaddr *)&upstream, upstream_len);
+			netout_nsent = write(netfd, stdin_buf, stdin_nrecvd);
+			if (netout_nsent < 0)
+				die("-1 on write to netfd");
+			else
+				fprintf(stderr, "%d/%d bytes to netfd\n", netout_nsent, stdin_nrecvd);
 			FD_CLR(netfd, &writefds);
 		}
 
@@ -258,13 +252,15 @@ static void output_loop()
 			/* Read from stdin */
 			stdin_nrecvd = read(STDIN_FILENO, stdin_buf,
 				sizeof(stdin_buf));
+			fprintf(stderr, "%d bytes from stdin\n", stdin_nrecvd);
 			FD_SET(netfd, &writefds);
 		}
 
 		if (FD_ISSET(netfd, &readfds)) {
 			/* Read from netfd */
-			netin_nrecvd = recvfrom(netfd, netin_buf,
-				sizeof(netin_buf), 0, 0, 0);
+			netin_nrecvd = read(netfd, netin_buf,
+				sizeof(netin_buf));
+			fprintf(stderr, "%d bytes from netfd\n", netin_nrecvd);
 			FD_SET(STDOUT_FILENO, &writefds);
 		}
 
@@ -273,13 +269,18 @@ static void output_loop()
 
 int main(int argc, char *argv[])
 {
+	int netfd;
 	if (argc < 2)
 		die("Not enough args");
 
-	if (!strcmp(argv[1], "-l"))
-		input_loop(53);
-	else if (!strcmp(argv[1], "-u"))
-		output_loop();
+	if (!strcmp(argv[1], "-l")) {
+		netfd = udp_listen_sock(1053);
+		connect_to_first_client(netfd);
+		rwloop(netfd);
+	} else if (!strcmp(argv[1], "-u")) {
+		netfd = udp_upstream_sock(get_upstream_address(), 53);
+		rwloop(netfd);
+	}
 
 	return 0;
 }
