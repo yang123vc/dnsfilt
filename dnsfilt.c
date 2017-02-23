@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
+#include <getopt.h>
 
 #if 0
 struct DNS_HEADER
@@ -109,6 +110,7 @@ void die(const char *msg)
 	perror(msg);
 	exit(-1);
 }
+static int vflag;
 static int udpsock();
 static void make_listen_sockaddr(struct sockaddr_in *outaddr, short port);
 static void make_upstream_sockaddr(struct sockaddr_in *outaddr,
@@ -156,11 +158,6 @@ static int udpsock()
 		die("udpsock: error opening socket");
 
 	return sockfd;
-}
-
-static const char *get_upstream_address()
-{
-	return "8.8.8.8";
 }
 
 static void make_upstream_sockaddr(struct sockaddr_in *outaddr,
@@ -225,7 +222,8 @@ static void rwloop(int netfd)
 
 		nready = select(10, &readfds, &writefds, 0, 0);
 
-		fprintf(stderr, "nready %d\n", nready);
+		if (vflag)
+			fprintf(stderr, "nready %d\n", nready);
 		if (FD_ISSET(STDOUT_FILENO, &writefds)) {
 			/* write to stdout */
 			stdout_nsent = write(STDOUT_FILENO, netin_buf, netin_nrecvd);
@@ -233,7 +231,8 @@ static void rwloop(int netfd)
 			if (stdout_nsent < 0)
 				die("-1 on write to stdout");
 			else
-				fprintf(stderr, "%d/%d bytes to stdout\n", stdout_nsent, netin_nrecvd);
+				if (vflag)
+					fprintf(stderr, "%d/%d bytes to stdout\n", stdout_nsent, netin_nrecvd);
 			/* remove self from polling */
 			FD_CLR(STDOUT_FILENO, &writefds);
 		}
@@ -244,7 +243,8 @@ static void rwloop(int netfd)
 			if (netout_nsent < 0)
 				die("-1 on write to netfd");
 			else
-				fprintf(stderr, "%d/%d bytes to netfd\n", netout_nsent, stdin_nrecvd);
+				if (vflag)
+					fprintf(stderr, "%d/%d bytes to netfd\n", netout_nsent, stdin_nrecvd);
 			FD_CLR(netfd, &writefds);
 		}
 
@@ -252,7 +252,8 @@ static void rwloop(int netfd)
 			/* Read from stdin */
 			stdin_nrecvd = read(STDIN_FILENO, stdin_buf,
 				sizeof(stdin_buf));
-			fprintf(stderr, "%d bytes from stdin\n", stdin_nrecvd);
+			if (vflag)
+				fprintf(stderr, "%d bytes from stdin\n", stdin_nrecvd);
 			FD_SET(netfd, &writefds);
 		}
 
@@ -260,7 +261,8 @@ static void rwloop(int netfd)
 			/* Read from netfd */
 			netin_nrecvd = read(netfd, netin_buf,
 				sizeof(netin_buf));
-			fprintf(stderr, "%d bytes from netfd\n", netin_nrecvd);
+			if (vflag)
+				fprintf(stderr, "%d bytes from netfd\n", netin_nrecvd);
 			FD_SET(STDOUT_FILENO, &writefds);
 		}
 
@@ -270,15 +272,60 @@ static void rwloop(int netfd)
 int main(int argc, char *argv[])
 {
 	int netfd;
-	if (argc < 2)
-		die("Not enough args");
+	int opt, opt_idx;
+	int lflag = 0;
+	const char *hflag = 0, *pflag = 0;
+	struct option long_options[] = {
+		{"listen",  no_argument,       0, 'l'},
+		{"host",    required_argument, 0, 'h'},
+		{"port",    required_argument, 0, 'p'},
+		{"verbose", no_argument,       0, 'v'}
+	};
 
-	if (!strcmp(argv[1], "-l")) {
-		netfd = udp_listen_sock(1053);
+	for (;;) {
+		opt = getopt_long(argc, argv, "lvh:p:", long_options, &opt_idx);
+		if (opt < 0)
+			break;
+
+		switch (opt) {
+		case 'l':
+			lflag = 1;
+			break;
+		case 'h':
+			hflag = optarg;
+			break;
+		case 'p':
+			pflag = optarg;
+			break;
+		case 'v':
+			vflag = 1;
+			break;
+		}
+	}
+
+	if (lflag && hflag) {
+		fprintf(stderr, "Cannot use --listen and --host\n");
+		return -1;
+	}
+
+	if (!lflag && !hflag) {
+		fprintf(stderr, "Must use --listen or --host\n");
+		return -1;
+	}
+
+	if (!pflag) {
+		fprintf(stderr, "--port required\n");
+		return -1;
+	}
+
+	if (lflag) {
+		netfd = udp_listen_sock(atoi(pflag));
 		connect_to_first_client(netfd);
 		rwloop(netfd);
-	} else if (!strcmp(argv[1], "-u")) {
-		netfd = udp_upstream_sock(get_upstream_address(), 53);
+	}
+
+	if (hflag) {
+		netfd = udp_upstream_sock(hflag, atoi(pflag));
 		rwloop(netfd);
 	}
 
